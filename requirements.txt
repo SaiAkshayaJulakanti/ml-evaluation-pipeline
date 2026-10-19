@@ -1,0 +1,5 @@
+numpy
+pandas
+scikit-learn
+# optional: tests run with stdlib unittest, pytest also works
+pytest
