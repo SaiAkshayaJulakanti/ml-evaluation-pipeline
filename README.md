@@ -1,6 +1,7 @@
-# Evaluation protocol and baseline
+# Evaluation protocol, baseline and search
 
-Day 1 (Mon 19 Oct 2026): evaluation protocol and baseline.
+- Day 1 (Mon 19 Oct 2026): evaluation protocol and baseline.
+- Day 2 (Tue 20 Oct 2026): leakage-safe pipelines and bounded hyperparameter search. See [Day 2](#day-2-leakage-safe-pipelines-and-bounded-search) below.
 
 Picks a dataset and target, defines a leakage-safe validation policy based on
 the data structure (stratified / group / time-aware), fixes the metrics, and
@@ -21,9 +22,10 @@ evalproto/
   splits.py     strategy selection, hold-out/CV splitters, leakage checks
   metrics.py    metric set (primary: PR-AUC)
   baseline.py   dummy floors, rule baseline, logistic regression -> results/baseline.json
-tests/          happy-path and negative/boundary tests (22)
-docs/           split policy, metric choice, baseline, limitations
-results/        baseline.json (generated)
+  search.py     pipelines + bounded seeded random search -> results/search.json
+tests/          test_protocol.py (22, Day 1), test_search.py (17, Day 2)
+docs/           SPLIT_POLICY.md (Day 1), SEARCH_POLICY.md (Day 2)
+results/        baseline.json, search.json (generated)
 ```
 
 ## Run
@@ -31,7 +33,8 @@ results/        baseline.json (generated)
 ```bash
 pip install -r requirements.txt           # numpy, pandas, scikit-learn
 python -m evalproto.baseline               # prints table, writes results/baseline.json
-python -m unittest discover -s tests -v    # 22 tests (pytest also works)
+python -m evalproto.search                 # Day 2: ~1 min, writes results/search.json
+python -m unittest discover -s tests -v    # 39 tests, ~1 min (pytest also works)
 python -m evalproto.data                   # optional: writes data/energy_meter.csv (git-ignored)
 ```
 
@@ -77,3 +80,44 @@ Covered in `tests/test_protocol.py`:
 - Anomalies contaminate the lag features 24 h / 168 h later, which caps precision (about 0.5).
 - Decision threshold fixed at 0.5.
 - Stratified and group branches are tested on synthetic arrays only.
+
+---
+
+# Day 2: leakage-safe pipelines and bounded search
+
+Full write-up: [docs/SEARCH_POLICY.md](docs/SEARCH_POLICY.md).
+
+**What it does.** `python -m evalproto.search` runs a seeded random search for two
+model families (logistic regression, gradient boosting). Every candidate is a
+`Pipeline(scale -> classifier)`, scored by mean PR-AUC over time-aware CV folds
+of the **training portion only**. The best config per family is refit on all
+training rows and scored on the locked hold-out once. The model family is chosen
+by CV score, never by hold-out.
+
+**Decisions.**
+- The hold-out is not an argument to the search function, so it cannot be used by accident.
+- Scaling is inside the pipeline, so it is fit per fold on training rows only.
+- Reproducible: seeded sampler and models, single process; two full runs give identical JSON.
+- Bounded: at most 50 trials per call (hard cap, error above it), a wall-clock budget per family that stops cleanly with partial results, and an optional cap on rows per fit.
+
+**Results (seed 42, 12 trials per family).**
+
+| Family | Best CV PR-AUC | Hold-out PR-AUC | Hold-out recall | Hold-out precision |
+|---|---|---|---|---|
+| Logistic regression | 0.586 | 0.609 | 0.979 | 0.545 |
+| Gradient boosting (selected) | 0.991 | 0.997 | 0.989 | 0.976 |
+
+Tuning within a family moved CV PR-AUC by under 0.015; switching family is what
+gave the jump. A shuffled-label control scores near chance, so it is not leakage.
+
+**Evidence of negative / boundary behaviour** (`tests/test_search.py`):
+- search never fits on a hold-out row; scaler is fit on each fold's training rows only
+- 51 trials rejected, exactly 50 accepted, 0 trials and a non-positive time budget rejected
+- time budget exhausted mid-search returns partial results flagged `stopped_early`; exhausted before the first trial returns no best config
+- `max_rows` caps rows per fit; unknown model family rejected
+- same seed gives identical trials, different seed gives different configs
+- shuffled labels collapse to chance (a leaking search would still score high)
+
+**Known limitations.** Simulated data (the 0.99 will not transfer to real
+meters); only 12 random candidates; no nested CV, so CV is slightly optimistic
+(the hold-out agrees); the time budget is checked between candidates, not inside one.
