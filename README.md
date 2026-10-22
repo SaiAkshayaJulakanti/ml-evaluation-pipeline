@@ -3,6 +3,7 @@
 - Day 1 (Mon 19 Oct 2026): evaluation protocol and baseline.
 - Day 2 (Tue 20 Oct 2026): leakage-safe pipelines and bounded hyperparameter search. See [Day 2](#day-2-leakage-safe-pipelines-and-bounded-search) below.
 - Day 3 (Wed 21 Oct 2026): error analysis and model selection. See [Day 3](#day-3-error-analysis-and-model-selection) below.
+- Day 4 (Thu 22 Oct 2026): experiment logs and reproducibility. See [Day 4](#day-4-experiment-logs-and-reproducibility) below.
 
 Picks a dataset and target, defines a leakage-safe validation policy based on
 the data structure (stratified / group / time-aware), fixes the metrics, and
@@ -25,9 +26,10 @@ evalproto/
   baseline.py   dummy floors, rule baseline, logistic regression -> results/baseline.json
   search.py     pipelines + bounded seeded random search -> results/search.json
   analysis.py   OOF error analysis, thresholds, slices, bootstrap, selection -> results/model_selection.json
-tests/          test_protocol.py (22, Day 1), test_search.py (17, Day 2), test_analysis.py (30, Day 3)
-docs/           SPLIT_POLICY.md (Day 1), SEARCH_POLICY.md (Day 2), MODEL_SELECTION.md (Day 3)
-results/        baseline.json, search.json, model_selection.json (generated)
+  tracking.py   experiment log (data hash, params, code revision, metrics, artifacts) + re-run check
+tests/          test_protocol.py (22, Day 1), test_search.py (17, Day 2), test_analysis.py (30, Day 3), test_tracking.py (35, Day 4)
+docs/           SPLIT_POLICY.md (Day 1), SEARCH_POLICY.md (Day 2), MODEL_SELECTION.md (Day 3), REPRODUCIBILITY.md (Day 4)
+results/        baseline.json, search.json, model_selection.json (generated), experiments.jsonl (run log, committed)
 ```
 
 ## Run
@@ -37,7 +39,9 @@ pip install -r requirements.txt           # numpy, pandas, scikit-learn
 python -m evalproto.baseline               # prints table, writes results/baseline.json
 python -m evalproto.search                 # Day 2: ~1 min, writes results/search.json
 python -m evalproto.analysis               # Day 3: ~25 s, needs search.json, writes results/model_selection.json
-python -m unittest discover -s tests -v    # 69 tests, ~1 min (pytest also works)
+python -m evalproto.tracking run           # Day 4: log the selected experiment (~5 s)
+python -m evalproto.tracking verify        # Day 4: re-run and compare within tolerance (exit 0 = consistent)
+python -m unittest discover -s tests -v    # 104 tests, ~1.5 min (pytest also works)
 python -m evalproto.data                   # optional: writes data/energy_meter.csv (git-ignored)
 ```
 
@@ -176,3 +180,36 @@ and error findings must be re-measured on real data); the overfit and slice gate
 not separate these four models and their limits are judgement calls; the 95% recall
 target is an assumption about cost; the work-hours explanation is an untested
 hypothesis; new-building performance is still not measured.
+
+---
+
+# Day 4: experiment logs and reproducibility
+
+Full write-up: [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
+
+**What it does.** `python -m evalproto.tracking run` runs the selected experiment (Day 3 winner,
+gradient boosting without class weights) and appends one JSON line to `results/experiments.jsonl`:
+SHA-256 fingerprint of the dataset, preprocessing steps, hyper-parameters, seed and split, git commit
+(plus a dirty flag and a hash of the source), library versions, metrics, and hashes of the input/output
+files. `python -m evalproto.tracking verify` re-runs the latest logged experiment and compares.
+
+**Decisions.**
+- The configuration must match exactly (data hash, params, seed, split); otherwise the runs are reported as not comparable instead of passing or failing.
+- Dataset identity is a hash of the features rounded to 4 decimals (the exact hash differs between machines by float noise and is only recorded).
+- Metrics must agree within stated tolerances: PR-AUC 0.002, precision/recall 0.01, threshold 0.05 (widened from 0.02 after measuring 0.024 on another machine), error counts 2.
+- The log is append-only JSON Lines; a corrupt line raises an error.
+
+**Result.** Same machine: every metric identical (difference 0), also with one thread. Different machine
+(Python 3.13 Linux vs 3.14 Windows): consistent within tolerance, CV PR-AUC 0.98981 vs 0.98938, hold-out
+PR-AUC 0.99770 vs 0.99713, recall 0.981 vs 0.976, false negatives 7 vs 9 (exactly at the tolerance).
+
+**Evidence of negative / boundary behaviour** (`tests/test_tracking.py`):
+- a changed cell, label, row order or column changes the data hash (float noise of 1e-13 does not); a changed hyper-parameter or data makes the re-run `ComparabilityError`
+- a logged metric edited by 0.05 fails `verify`; exactly at tolerance passes, just beyond fails; NaN fails; a missing metric, empty log, unknown run and corrupt log line raise errors
+- outside a git repo the revision is `unknown` and the source hash still works; the log never rewrites earlier lines
+- mutation-checked: ignoring tolerance, skipping the configuration check, letting NaN pass, ignoring labels in the hash and overwriting the log each make tests fail
+
+**Known limitations.** Tolerance is a judgement measured in two environments (the threshold one was widened after the fact, the false-negative difference sat at its limit); the log has
+no signature (an edited number is caught, a deleted line is not); simulated data is regenerated, so
+real data would need a stored or versioned copy; only the selected experiment is logged; no model file
+is stored (it refits in about 5 s).
