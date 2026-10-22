@@ -39,6 +39,10 @@ class Dataset:
     groups: np.ndarray | None  # building id; None => rows are independent
     time: np.ndarray | None  # integer hour index; None => no temporal ordering
     name: str
+    # Slice-only information for error analysis (never a model input): building,
+    # hour of day, weekend flag, temperature, event_type (0 none, 1 spike, 2 drop)
+    # and event_pos (hour within the event, 0 = first hour; -1 when no event).
+    meta: pd.DataFrame | None = None
 
 
 def simulate_raw(seed: int = SEED, n_buildings: int = N_BUILDINGS, n_days: int = N_DAYS) -> pd.DataFrame:
@@ -58,13 +62,18 @@ def simulate_raw(seed: int = SEED, n_buildings: int = N_BUILDINGS, n_days: int =
         expected = size * (0.3 + 0.7 * workhour) * (1 + 0.03 * np.abs(temp - 18))
         cons = expected * (1 + rng.normal(0, 0.05, n_hours))
         label = np.zeros(n_hours, dtype=int)
+        etype = np.zeros(n_hours, dtype=int)  # metadata only; draws no random numbers
+        epos = np.full(n_hours, -1, dtype=int)
         t = 0
         while t < n_hours:
             if rng.random() < 0.012:
                 length = int(rng.integers(1, 5))
-                factor = rng.uniform(1.5, 2.5) if rng.random() < 0.7 else rng.uniform(0.2, 0.5)
+                is_spike = rng.random() < 0.7
+                factor = rng.uniform(1.5, 2.5) if is_spike else rng.uniform(0.2, 0.5)
                 cons[t : t + length] *= factor
                 label[t : t + length] = 1
+                etype[t : t + length] = 1 if is_spike else 2
+                epos[t : t + length] = np.arange(len(epos[t : t + length]))
                 t += length
             else:
                 t += 1
@@ -79,6 +88,8 @@ def simulate_raw(seed: int = SEED, n_buildings: int = N_BUILDINGS, n_days: int =
                     "building_size": size,
                     "consumption": cons,
                     "anomaly": label,
+                    "event_type": etype,
+                    "event_pos": epos,
                 }
             )
         )
@@ -121,6 +132,7 @@ def load_dataset() -> Dataset:
         groups=df["building"].to_numpy(),
         time=df["hour"].to_numpy(dtype=np.int64),
         name="simulated_energy_meter",
+        meta=df[["building", "hour", "hod", "is_weekend", "temperature", "event_type", "event_pos"]].copy(),
     )
 
 

@@ -1,7 +1,8 @@
-# Evaluation protocol, baseline and search
+# Evaluation protocol, baseline, search and model selection
 
 - Day 1 (Mon 19 Oct 2026): evaluation protocol and baseline.
 - Day 2 (Tue 20 Oct 2026): leakage-safe pipelines and bounded hyperparameter search. See [Day 2](#day-2-leakage-safe-pipelines-and-bounded-search) below.
+- Day 3 (Wed 21 Oct 2026): error analysis and model selection. See [Day 3](#day-3-error-analysis-and-model-selection) below.
 
 Picks a dataset and target, defines a leakage-safe validation policy based on
 the data structure (stratified / group / time-aware), fixes the metrics, and
@@ -23,9 +24,10 @@ evalproto/
   metrics.py    metric set (primary: PR-AUC)
   baseline.py   dummy floors, rule baseline, logistic regression -> results/baseline.json
   search.py     pipelines + bounded seeded random search -> results/search.json
-tests/          test_protocol.py (22, Day 1), test_search.py (17, Day 2)
-docs/           SPLIT_POLICY.md (Day 1), SEARCH_POLICY.md (Day 2)
-results/        baseline.json, search.json (generated)
+  analysis.py   OOF error analysis, thresholds, slices, bootstrap, selection -> results/model_selection.json
+tests/          test_protocol.py (22, Day 1), test_search.py (17, Day 2), test_analysis.py (30, Day 3)
+docs/           SPLIT_POLICY.md (Day 1), SEARCH_POLICY.md (Day 2), MODEL_SELECTION.md (Day 3)
+results/        baseline.json, search.json, model_selection.json (generated)
 ```
 
 ## Run
@@ -34,7 +36,8 @@ results/        baseline.json, search.json (generated)
 pip install -r requirements.txt           # numpy, pandas, scikit-learn
 python -m evalproto.baseline               # prints table, writes results/baseline.json
 python -m evalproto.search                 # Day 2: ~1 min, writes results/search.json
-python -m unittest discover -s tests -v    # 39 tests, ~1 min (pytest also works)
+python -m evalproto.analysis               # Day 3: ~25 s, needs search.json, writes results/model_selection.json
+python -m unittest discover -s tests -v    # 69 tests, ~1 min (pytest also works)
 python -m evalproto.data                   # optional: writes data/energy_meter.csv (git-ignored)
 ```
 
@@ -121,3 +124,55 @@ gave the jump. A shuffled-label control scores near chance, so it is not leakage
 **Known limitations.** Simulated data (the 0.99 will not transfer to real
 meters); only 12 random candidates; no nested CV, so CV is slightly optimistic
 (the hold-out agrees); the time budget is checked between candidates, not inside one.
+
+---
+
+# Day 3: error analysis and model selection
+
+Full write-up with every number: [docs/MODEL_SELECTION.md](docs/MODEL_SELECTION.md).
+
+**What it does.** `python -m evalproto.analysis` compares four candidates (rule,
+logistic regression, class-weighted boosting, unweighted boosting) on several
+kinds of evidence instead of one score, then applies a written selection rule.
+Everything that decides is computed from out-of-fold predictions on the training
+portion; the hold-out only confirms.
+
+**Evidence examined:** fold-to-fold stability and overfit gap (train vs CV score);
+class imbalance (lift over the no-skill floor, effect of class weighting); threshold
+trade-off (precision, recall and alerts per 1,000 hours); error slices by building,
+time of day, weekday/weekend, temperature, anomaly type and position in the event;
+where false alarms come from; and a paired bootstrap (resampling days) on the hold-out.
+
+**Decision:** gradient boosting without class weights, alerting at score >= 0.303
+(threshold chosen as the highest that still catches 95% of anomalies out-of-fold).
+
+| Model | CV PR-AUC | Overfit gap | Hold-out precision | Hold-out recall | False alarms in hold-out |
+|---|---|---|---|---|---|
+| Rule | 0.519 | -0.001 | 0.496 | 0.979 | 373 |
+| Logistic regression | 0.586 | -0.002 | 0.599 | 0.963 | 242 |
+| Boosting, weighted | 0.991 | 0.009 | 0.978 | 0.965 | 8 |
+| Boosting, unweighted (selected) | 0.990 | 0.010 | 0.979 | 0.981 | 8 |
+
+**Main findings.**
+- Boosting beats the rule and logistic regression decisively (paired bootstrap on the hold-out: +0.47 and +0.39 PR-AUC, intervals far from zero).
+- Weighted and unweighted boosting are tied (difference +0.000, interval includes zero), so the simpler unweighted model wins by the written tie rule, not by a 0.001 edge.
+- 92% of the rule's false alarms and 89% of logistic regression's fire exactly 24 or 168 hours after a real anomaly (about 15 times the chance rate). That explains the precision of about 0.5 on Day 1.
+- Weakest slices for the selected model: work hours (recall 0.92 vs 0.97 at night), weekends (0.92 vs 0.96) and warm hours (0.93 vs 0.96).
+
+**Evidence of negative / boundary behaviour** (`tests/test_analysis.py`):
+- a slice with 19 anomalies is flagged `insufficient_positives` and gets no metrics, exactly 20 is scored; an all-positive slice is flagged
+- a recall target of 0, negative or above 1 is rejected; 1.0 is accepted; a target with no positives to reach is rejected
+- bootstrap rejects fewer than 10 days and all-single-class resamples; identical models give a zero difference whose interval covers 0
+- selection: an overfit model is excluded even if it has the best CV score, a weak slice excludes a model, no eligible model raises an error, a lead exactly at the tie margin is a tie and just beyond it is not
+- missing `results/search.json` gives a clear error telling you to run Day 2 first
+- the tests were mutation-checked: reversing the threshold direction, dropping the 168 h lag, removing the small-slice guard and disabling the tie rule each make tests fail
+
+**Data change.** The dataset now also exposes slice-only metadata (anomaly type and
+position in the event). It is never a model input, and features, labels, time and groups
+were verified identical to Day 1, so earlier results are unchanged.
+
+**Known limitations.** Simulated data (absolute scores will not transfer, and the slice
+and error findings must be re-measured on real data); the overfit and slice gates did
+not separate these four models and their limits are judgement calls; the 95% recall
+target is an assumption about cost; the work-hours explanation is an untested
+hypothesis; new-building performance is still not measured.
