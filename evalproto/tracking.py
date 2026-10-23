@@ -190,12 +190,12 @@ def preprocessing_description() -> dict:
     }
 
 
-def run_experiment(model_name: str | None = None, param_overrides: dict | None = None,
-                   dataset=None) -> dict:
-    """Run one experiment end to end and return its full tracking record.
+def plan_experiment(model_name: str | None = None, param_overrides: dict | None = None, dataset=None) -> dict:
+    """Everything that defines an experiment, WITHOUT scoring the hold-out.
 
-    `param_overrides` and `dataset` exist so tests can show that a changed
-    configuration is detected; normal use leaves them as None.
+    Returns the model, data, split indices, configuration and `config_id`. The Day 5
+    hold-out ledger uses this to decide whether a configuration was already evaluated
+    before any hold-out score is computed.
     """
     model_name = model_name or selected_model_name()
     models = build_models(load_best_params())
@@ -204,10 +204,38 @@ def run_experiment(model_name: str | None = None, param_overrides: dict | None =
     model = models[model_name]
     if param_overrides:
         model = model.set_params(**param_overrides)
-
     ds = dataset or load_dataset()
-    X, y, t = ds.X.to_numpy(), ds.y.to_numpy(), ds.time
+    y, t = ds.y.to_numpy(), ds.time
     train_idx, test_idx = holdout_split(y, ds.groups, t, test_size=HOLDOUT_FRACTION, seed=SEED, gap=GAP)
+    config = {
+        "model": model_name,
+        "model_class": type(model).__name__,
+        "params": _simple_params(model),
+        "seed": SEED,
+        "split": {"holdout_fraction": HOLDOUT_FRACTION, "gap_hours": GAP, "cv": "expanding window",
+                  "n_splits": N_SPLITS, "train_rows": int(len(train_idx)), "holdout_rows": int(len(test_idx))},
+        "dataset": {"name": ds.name, "rows": int(len(ds.X)), "positives": int(y.sum()),
+                    "fingerprint": fingerprint_dataset(ds.X, ds.y, ds.time, ds.groups, IDENTITY_DECIMALS),
+                    "fingerprint_decimals": IDENTITY_DECIMALS},
+        "preprocessing": preprocessing_description(),
+    }
+    return {"model_name": model_name, "model": model, "ds": ds, "train_idx": train_idx, "test_idx": test_idx,
+            "config": config, "config_id": sha256_bytes(json.dumps(config, sort_keys=True).encode())[:16]}
+
+
+def run_experiment(model_name: str | None = None, param_overrides: dict | None = None,
+                   dataset=None, capture: dict | None = None, stage: str | None = None) -> dict:
+    """Run one experiment end to end and return its full tracking record.
+
+    `param_overrides` and `dataset` exist so tests can show that a changed
+    configuration is detected; normal use leaves them as None. `capture`, if a dict,
+    receives the fitted model and the scores (used by Day 5 so the hold-out is scored
+    only once); `stage` labels the record (e.g. "final_evaluation").
+    """
+    plan = plan_experiment(model_name, param_overrides, dataset)
+    model, ds, config = plan["model"], plan["ds"], plan["config"]
+    train_idx, test_idx = plan["train_idx"], plan["test_idx"]
+    X, y, t = ds.X.to_numpy(), ds.y.to_numpy(), ds.time
     Xtr, ytr, ttr = X[train_idx], y[train_idx], t[train_idx]
 
     idx, oof, fid = oof_scores(model, Xtr, ytr, ttr)
@@ -228,23 +256,13 @@ def run_experiment(model_name: str | None = None, param_overrides: dict | None =
         "holdout_false_positives": op["fp"],
         "holdout_false_negatives": op["fn"],
     }
-    config = {
-        "model": model_name,
-        "model_class": type(model).__name__,
-        "params": _simple_params(model),
-        "seed": SEED,
-        "split": {"holdout_fraction": HOLDOUT_FRACTION, "gap_hours": GAP, "cv": "expanding window",
-                  "n_splits": N_SPLITS, "train_rows": int(len(train_idx)), "holdout_rows": int(len(test_idx))},
-        "dataset": {"name": ds.name, "rows": int(len(ds.X)), "positives": int(y.sum()),
-                    "fingerprint": fingerprint_dataset(ds.X, ds.y, ds.time, ds.groups, IDENTITY_DECIMALS),
-                    "fingerprint_decimals": IDENTITY_DECIMALS},
-        "preprocessing": preprocessing_description(),
-    }
-    return {
+    if capture is not None:
+        capture.update(plan=plan, model=final, oof_idx=idx, oof=oof, s_test=s_test, threshold=thr)
+    record = {
         "run_id": None,  # assigned by log_run
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config": config,
-        "config_id": sha256_bytes(json.dumps(config, sort_keys=True).encode())[:16],
+        "config_id": plan["config_id"],
         "code": {**code_revision(), "source_hash": code_hash()},
         "environment": environment(),
         "metrics": metrics,
@@ -256,6 +274,9 @@ def run_experiment(model_name: str | None = None, param_overrides: dict | None =
             "results/model_selection.json": sha256_file(SELECTION_JSON),
         },
     }
+    if stage:
+        record["stage"] = stage
+    return record
 
 
 # ---- the log ----------------------------------------------------------------

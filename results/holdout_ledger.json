@@ -1,0 +1,13 @@
+{
+  "entries": [
+    {
+      "candidate": "hgb_unweighted",
+      "config_id": "6d28e1a05f466d11",
+      "dataset_identity_hash": "c54ee06d2aa26aecaa14240ed6df32cf7d952e06c02a0ba8f6fef8a34cf53e28",
+      "evaluated_utc": "2026-10-23T04:15:47+00:00",
+      "release": true,
+      "run_id": "run-002-6d28e1"
+    }
+  ],
+  "note": "Each entry is one formal hold-out evaluation. A configuration (config_id) can appear once. Earlier confirmation scores on Days 2 to 4 are not recorded here."
+}

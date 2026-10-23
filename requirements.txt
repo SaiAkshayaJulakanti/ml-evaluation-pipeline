@@ -2,5 +2,6 @@ numpy
 pandas
 scikit-learn
 scipy
+joblib  # installed with scikit-learn; used to save the model package
 # optional: tests run with stdlib unittest, pytest also works
 pytest

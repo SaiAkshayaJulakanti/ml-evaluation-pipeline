@@ -4,6 +4,7 @@
 - Day 2 (Tue 20 Oct 2026): leakage-safe pipelines and bounded hyperparameter search. See [Day 2](#day-2-leakage-safe-pipelines-and-bounded-search) below.
 - Day 3 (Wed 21 Oct 2026): error analysis and model selection. See [Day 3](#day-3-error-analysis-and-model-selection) below.
 - Day 4 (Thu 22 Oct 2026): experiment logs and reproducibility. See [Day 4](#day-4-experiment-logs-and-reproducibility) below.
+- Day 5 (Fri 23 Oct 2026): model validation capstone. See [Day 5](#day-5-model-validation-capstone) below.
 
 Picks a dataset and target, defines a leakage-safe validation policy based on
 the data structure (stratified / group / time-aware), fixes the metrics, and
@@ -27,8 +28,12 @@ evalproto/
   search.py     pipelines + bounded seeded random search -> results/search.json
   analysis.py   OOF error analysis, thresholds, slices, bootstrap, selection -> results/model_selection.json
   tracking.py   experiment log (data hash, params, code revision, metrics, artifacts) + re-run check
-tests/          test_protocol.py (22, Day 1), test_search.py (17, Day 2), test_analysis.py (30, Day 3), test_tracking.py (35, Day 4)
-docs/           SPLIT_POLICY.md (Day 1), SEARCH_POLICY.md (Day 2), MODEL_SELECTION.md (Day 3), REPRODUCIBILITY.md (Day 4)
+  inference.py  raw readings -> validated features -> score -> alert; model package save/load
+  monitoring.py PSI drift, alert-rate, input-quality and label signals
+  final.py      release gates, one-time hold-out evaluation + ledger, packaging, CLI
+tests/          test_protocol.py (22, Day 1), test_search.py (17, Day 2), test_analysis.py (30, Day 3), test_tracking.py (35, Day 4), test_inference.py (24), test_monitoring.py (21), test_final.py (22), all Day 5
+docs/           SPLIT_POLICY.md (Day 1), SEARCH_POLICY.md (Day 2), MODEL_SELECTION.md (Day 3), REPRODUCIBILITY.md (Day 4), FINAL_REPORT.md and MODEL_CARD.md (Day 5)
+models/         final/package.json (metadata; model.joblib is git-ignored, rebuild with `final build`)
 results/        baseline.json, search.json, model_selection.json (generated), experiments.jsonl (run log, committed)
 ```
 
@@ -41,7 +46,10 @@ python -m evalproto.search                 # Day 2: ~1 min, writes results/searc
 python -m evalproto.analysis               # Day 3: ~25 s, needs search.json, writes results/model_selection.json
 python -m evalproto.tracking run           # Day 4: log the selected experiment (~5 s)
 python -m evalproto.tracking verify        # Day 4: re-run and compare within tolerance (exit 0 = consistent)
-python -m unittest discover -s tests -v    # 104 tests, ~1.5 min (pytest also works)
+python -m evalproto.final build               # Day 5: rebuild models/final (needs search.json + model_selection.json)
+python -m evalproto.final predict raw.csv    # Day 5: alerts from raw readings
+python -m evalproto.final monitor raw.csv    # Day 5: drift / quality / label signals
+python -m unittest discover -s tests -v    # 171 tests, ~1.5 min (pytest also works)
 python -m evalproto.data                   # optional: writes data/energy_meter.csv (git-ignored)
 ```
 
@@ -213,3 +221,36 @@ PR-AUC 0.99770 vs 0.99713, recall 0.981 vs 0.976, false negatives 7 vs 9 (exactl
 no signature (an edited number is caught, a deleted line is not); simulated data is regenerated, so
 real data would need a stored or versioned copy; only the selected experiment is logged; no model file
 is stored (it refits in about 5 s).
+
+---
+
+# Day 5: model validation capstone
+
+Full write-ups: [docs/FINAL_REPORT.md](docs/FINAL_REPORT.md) (comparison report) and [docs/MODEL_CARD.md](docs/MODEL_CARD.md).
+
+**What it does.** `python -m evalproto.final evaluate` runs the one formal hold-out evaluation of the Day 3 winner
+(boosting without class weights, threshold 0.303), checks release gates that are declared in code before
+scoring, writes the experiment record, a ledger entry and the model package. `inference.py` turns raw hourly
+readings into alerts; `monitoring.py` computes drift, alert-rate, input-quality and label signals.
+
+**Decisions.**
+- A configuration can be formally evaluated once: the ledger refuses a second evaluation before scoring anything (`HoldoutAlreadyUsedError`); a changed configuration is allowed but is logged as another look.
+- Gates (PR-AUC, precision, recall at least 0.90; CV-to-hold-out drop at most 0.02; worst building recall at least 0.80, buildings with fewer than 10 anomalies not judged) are fixed in code and pinned by a test.
+- The package is the evaluated model (training portion only). The binary is git-ignored; `package.json` holds the metadata, hash, versions and monitoring reference, and `final build` recreates the model.
+- Feature drift alone can only raise the monitoring status to `warn`; `alert` needs an output-side signal.
+
+**Result.** Hold-out PR-AUC 0.9977, precision 0.979, recall 0.981 (8 false alarms, 7 misses of 375), worst
+judged building 0.867; all five gates passed, release = yes (on simulated data).
+
+**Evidence of negative / boundary behaviour** (`tests/test_final.py`, `test_inference.py`, `test_monitoring.py`):
+- each gate fails alone when its metric is just beyond the limit, passes exactly at it; NaN or no judged building fails; random scores and a single decision stump are not released
+- a second evaluation of the same configuration is refused and writes nothing; tests never touch the real ledger
+- features from raw readings equal the training features; 168 rows give no score, 169 give one; missing columns, NaN, bad values, duplicates and hour gaps are rejected
+- altered model file, missing files, wrong scikit-learn version and changed feature list are rejected on load
+- PSI and alert-rate status boundaries (exactly at the limit is not flagged); too few rows or expected alerts gives `not_evaluable`; drifted input raises an alert
+- mutation-checked: reversed gate, disabled ledger, no gap check, wrong lag, no file hash check, uncapped feature drift, scoring rows without history and judging tiny slices each make tests fail
+- bugs found by the tests and fixed: CSV round-trip float noise falsely flagged out-of-range values; a float edge made a gate at exactly 0.02 fail; the alert-rate signal was too noisy on small windows
+
+**Known limitations.** Simulated data, so absolute numbers will not transfer; the hold-out was also scored for
+confirmation on Days 2 to 4; gates and monitoring thresholds are judgement calls; known buildings only; one season; a
+pickle package must only be loaded from a trusted source. See the model card for the full list.
